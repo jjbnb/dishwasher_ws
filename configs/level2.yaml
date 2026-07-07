@@ -1,0 +1,55 @@
+# Level 2 配置：启发式策略
+# 场景：混合物体（盘/碗/杯/勺），随机位姿，域随机化
+
+robot:
+  type: "piper"
+  usd_path: "assets/isaac_dishwisher/piper/piper_description_v100_realsense_camera_v2.usd"
+  control_mode: "ik_absolute"  # IK 绝对位姿控制
+  ik_method: "dls"            # 阻尼最小二乘（更稳定）
+
+camera:
+  top_down:
+    height: 480
+    width: 640
+    position: [0.0, 0.0, 2.5]
+    look_at: [0.0, 0.0, 0.5]
+    data_types: ["rgb", "distance_to_image_plane", "instance_segmentation_fast"]
+  wrist:
+    height: 240
+    width: 320
+    data_types: ["rgb", "distance_to_image_plane"]
+
+scene:
+  usd_path: "assets/isaac_dishwisher/all.usd"
+  num_objects: 4
+  object_types: ["plate", "bowl", "cup", "spoon"]  # mixed objects
+
+perception:
+  method: "multimodal_fusion"  # RGB + Depth + InstanceSeg
+  pose_estimation: "icp_pca"
+  use_color_clustering: true
+  use_depth_clustering: true
+
+grasping:
+  strategy: "heuristic"  # geometry-based heuristic
+  max_candidates: 20
+  approach_height: 0.15
+  gripper_open: 0.04
+  gripper_closed: 0.0
+
+motion:
+  collision_check: true
+  trajectory_type: "linear_interpolation"
+  waypoints: 10
+
+domain_randomization:
+  light_intensity: [0.3, 3.0]
+  light_color_temp: [2500, 6500]
+  object_color_range: [0.1, 0.9]
+  friction_range: [0.3, 0.8]
+  mass_variation: 0.2  # ±20%
+
+state_machine:
+  max_retries: 2
+  skip_on_consecutive_fail: 3
+  cycle_timeout: 20.0

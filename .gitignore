@@ -1,0 +1,40 @@
+# Isaac Sim
+*.usd.lock
+__pycache__/
+*.pyc
+*.pyo
+.pt
+
+# Results
+results/**/*.csv
+results/**/*.json
+results/**/*.png
+
+# Videos
+videos/*.mp4
+
+# IDE
+.vscode/
+.idea/
+
+# Isaac Lab / Omniverse
+*_instanceable/
+*.kit
+
+# Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Docker
+docker/*.tar
+docker/*.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+*.env

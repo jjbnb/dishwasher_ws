@@ -1,0 +1,40 @@
+# Level 1 配置：规则策略
+# 场景：同款白盘子整齐排列，固定光照
+
+robot:
+  type: "piper"
+  usd_path: "assets/isaac_dishwisher/piper/piper_description_v100_realsense_camera_v2.usd"
+  control_mode: "joint_position"  # 直接关节位置控制
+  ik_method: "dls"                # 阻尼最小二乘 IK
+
+camera:
+  top_down:
+    height: 480
+    width: 640
+    position: [0.0, 0.0, 2.5]
+    look_at: [0.0, 0.0, 0.5]
+    data_types: ["rgb", "distance_to_image_plane"]
+  wrist:
+    height: 240
+    width: 320
+    data_types: ["rgb", "distance_to_image_plane"]
+
+scene:
+  usd_path: "assets/isaac_dishwisher/all.usd"
+  num_objects: 3
+  object_type: "plate"  # all identical plates
+
+perception:
+  method: "template_matching"  # simple, deterministic
+  use_depth_threshold: true
+  depth_range: [0.3, 1.5]
+
+grasping:
+  strategy: "fixed"  # predefined grasp poses
+  approach_height: 0.15
+  gripper_open: 0.04
+  gripper_closed: 0.0
+
+state_machine:
+  max_retries: 0  # no retry needed for Level 1
+  cycle_timeout: 10.0  # max seconds per pick-and-place
