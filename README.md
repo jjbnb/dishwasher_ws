@@ -41,29 +41,36 @@ ln -s /path/to/isaac_dishwisher assets/isaac_dishwisher
 conda activate env_isaaclab
 cd ~/dishwasher_ws
 
-# 验证场景能加载
-python scripts/test_scene.py
+# 校验赛方原生 all.usd 结构（不启动 Isaac）
+python scripts/validate_all_usd.py
+
+# 验证原生 all.usd 能作为仿真基座
+python scripts/test_m0_verify.py --headless
 
 # 验证 Piper 关节控制
-python scripts/test_piper_articulation.py
+python scripts/test_piper_articulation.py --headless
 
 # 验证盘子物理
-python scripts/test_plate_physics.py
+python scripts/test_plate_physics.py --headless
 
-# M0 完整验证（headless 模式，RTX 5070 可用）
+# M0 原生 all.usd headless 快照导出
 python scripts/demo_m0_render.py
+
+# M1 / Level 1 原生 all.usd smoke（detect + plan + IK）
+python scripts/run_level1_native.py --headless --num_plates 1
 ```
 
 ## M0 验证结果 ✅
 
 | 验证项 | 状态 | 详情 |
 |--------|------|------|
-| 场景加载 | ✅ | 地面 + 灯光 + 桌子 + Piper + 3 盘 |
-| Piper PD 控制 | ✅ | 8 关节 PD 控制，误差 < 0.05 |
-| 盘子物理 | ✅ | 重力下落 + 碰撞检测 |
-| USD 导出 | ✅ | 6 个关键帧场景文件 |
+| 原生 all.usd 结构 | ✅ | `metersPerUnit=0.01`, `/World` 默认 prim, 359 prim |
+| 原生场景内容 | ✅ | 房间 + 桌子/水槽/卡槽 + 双 Piper + 3 盘 + 相机 + ROS2 图 |
+| Piper 包装 | ✅ | 直接包装 `/World/piper_ros2_/piper_camera` 的 8 关节 Articulation |
+| 盘子包装 | ✅ | 直接包装原生 plate mesh RigidBody，不移动物理 API |
+| USD 导出 | ✅ | 导出原生场景打开/运行时准备/短步进快照 |
 
-输出位于 `results/m0_demo/`，含 00_init_scene 到 05_piper_restored 共 6 个 USD 文件。
+输出位于 `results/m0_demo/`，含 `00_native_all_usd_opened.usd` 等原生场景快照。
 
 ## 项目结构
 
@@ -77,7 +84,8 @@ dishwasher_ws/
 │
 ├── src/dishwasher/
 │   ├── scene/                  # 场景管理
-│   │   ├── loader.py           #   SceneLoader: 组件化场景装配
+│   │   ├── native_loader.py    #   NativeSceneLoader: 直接打开赛方 all.usd
+│   │   ├── loader.py           #   Legacy SceneLoader: 旧组件化装配（待迁移）
 │   │   └── piper_cfg.py        #   Piper ArticulationCfg (8 joints)
 │   ├── perception/             # 感知：检测 + 位姿估计 + 深度补全
 │   ├── grasping/               # 抓取：生成 + 过滤 + 排序
@@ -87,11 +95,13 @@ dishwasher_ws/
 │
 ├── scripts/                    # 运行脚本
 │   ├── test_*.py               #   各模块独立验证
-│   ├── demo_m0_render.py       #   M0 headless 物理演示
-│   ├── demo_m0_gui.py          #   M0 GUI 演示（需 A40）
+│   ├── validate_all_usd.py     #   原生 all.usd 结构校验
+│   ├── demo_m0_render.py       #   M0 native all.usd headless 演示
+│   ├── demo_m0_gui.py          #   M0 GUI 直接查看原生 all.usd
+│   ├── run_level1_native.py    #   M1 native all.usd detect/plan/IK smoke
 │   └── view_m0_usd.py          #   查看导出的 USD 场景
 │
-├── results/m0_demo/            # M0 验证输出（6 个 USD 文件）
+├── results/m0_demo/            # M0 原生 all.usd 快照输出
 └── docker/                     # Docker 打包
 ```
 
@@ -137,5 +147,7 @@ main
 ## 已知问题
 
 - **RTX 5070 (12GB)**: GUI + 完整物理场景 CUDA OOM，需在 A40 上做 GUI 验证
+- **原生 all.usd 单位**: `metersPerUnit=0.01`，Isaac Lab 张量读数按 stage units 显示为厘米尺度；不要再手动 `÷100 + Z_SHIFT` 重建场景
+- **原生 all.usd 运行时辅助节点**: 文件内含嵌套 `PhysicsScene` 和 ROS2 `ActionGraph`；直接 Isaac Lab 控制时脚本会运行时临时禁用这些节点，但不保存、不改源 USD
 - **Isaac Sim 5.1 截图 API**: `omni.syntheticdata`、`omni.replicator`、`renderer.capture` 均不可靠
 - **USD 导出不捕获物理状态**: `stage.Export()` 只导出 USD prim transform，非 PhysX Fabric 张量状态

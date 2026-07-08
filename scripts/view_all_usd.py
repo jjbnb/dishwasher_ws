@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open the native all.usd scene in Isaac Sim GUI."""
+"""Directly open the competition-provided all.usd scene."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ sys.path.insert(0, os.path.expanduser("~/dishwasher_ws/src"))
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="M0 native all.usd GUI viewer")
+parser = argparse.ArgumentParser(description="Direct all.usd viewer")
 parser.add_argument(
     "--assets",
     default=os.path.expanduser("~/dishwasher_ws/assets/isaac_dishwisher"),
 )
-parser.add_argument("--seconds", type=float, default=20.0)
+parser.add_argument("--seconds", type=float, default=0.0)
 parser.add_argument(
     "--native-camera",
     action="store_true",
@@ -34,21 +34,18 @@ from dishwasher.scene.native_loader import NativeSceneLoader
 
 
 def configure_view(stage, use_native_camera: bool):
-    """Set a visible viewport camera for GUI inspection."""
-
     camera_path = "/World/Camera" if use_native_camera else "/World/M0_OverviewCamera"
-
     if not use_native_camera:
         from pxr import Gf, UsdGeom
 
         camera = UsdGeom.Camera.Define(stage, camera_path)
         camera.GetFocalLengthAttr().Set(20.0)
         camera.GetClippingRangeAttr().Set(Gf.Vec2f(1.0, 100000.0))
-
-        eye = Gf.Vec3d(35.0, -85.0, 120.0)
-        target = Gf.Vec3d(85.0, 105.0, -5.0)
-        up = Gf.Vec3d(0.0, 0.0, 1.0)
-        view = Gf.Matrix4d().SetLookAt(eye, target, up)
+        view = Gf.Matrix4d().SetLookAt(
+            Gf.Vec3d(35.0, -85.0, 120.0),
+            Gf.Vec3d(85.0, 105.0, -5.0),
+            Gf.Vec3d(0.0, 0.0, 1.0),
+        )
         xform = UsdGeom.Xformable(camera)
         xform.ClearXformOpOrder()
         xform.AddTransformOp().Set(view.GetInverse())
@@ -64,10 +61,6 @@ def configure_view(stage, use_native_camera: bool):
         print(f"[WARN] Could not set active viewport camera: {exc}", flush=True)
 
 
-print("=" * 72)
-print("M0 native all.usd GUI")
-print("=" * 72)
-
 loader = NativeSceneLoader(args_cli.assets)
 report = loader.validate()
 if not report.ok:
@@ -77,13 +70,22 @@ if not report.ok:
 
 stage = loader.open_stage()
 configure_view(stage, args_cli.native_camera)
-print(f"opened: {loader.all_usd_path}", flush=True)
-print("This is the competition-provided scene, not a respawned reconstruction.")
-print(f"Keeping GUI open for {args_cli.seconds:.1f}s.", flush=True)
+print(f"[OK] opened native all.usd: {loader.all_usd_path}", flush=True)
+print("No coordinate conversion, respawn, extra ground plane, or collision helper was added.")
 
-deadline = time.time() + args_cli.seconds
-while simulation_app.is_running() and time.time() < deadline:
-    simulation_app.update()
-    time.sleep(0.01)
-
-simulation_app.close()
+if args_cli.headless:
+    simulation_app.close()
+elif args_cli.seconds > 0:
+    deadline = time.time() + args_cli.seconds
+    while simulation_app.is_running() and time.time() < deadline:
+        simulation_app.update()
+        time.sleep(0.01)
+    simulation_app.close()
+else:
+    try:
+        while simulation_app.is_running():
+            simulation_app.update()
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
+    simulation_app.close()

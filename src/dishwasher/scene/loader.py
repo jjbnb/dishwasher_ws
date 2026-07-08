@@ -1,16 +1,25 @@
-"""场景加载器 — 方案 A（组件化组装）。
+"""Legacy component-assembly scene loader.
 
-将赛方独立 USD 组件逐个 spawn 到默认 stage，施加物理属性后
-用 Articulation / RigidObject 包装，供后续感知/规划/控制模块使用。
+DEPRECATED for M0: use :mod:`dishwasher.scene.native_loader` to open the
+competition-provided ``all.usd`` directly.  This legacy loader converts
+coordinates from the native centimeter stage to meters, applies a Z shift, and
+respawns scene components.  It is kept only so older Level 1 experiments do not
+break while the pipeline is migrated to the native scene baseline.
 
-用法：
-    from dishwasher.scene.loader import SceneLoader
-    loader = SceneLoader(assets_root="~/dishwasher_ws/assets/isaac_dishwisher")
-    loader.spawn_static_objects()       # 地面 + 灯光 + 桌子
-    loader.spawn_piper()                # Piper 机械臂
-    loader.spawn_plates(n=3)            # 盘子
-    # 必须在 sim.reset() 后调用：
-    loader.wrap_assets()                # Articulation + RigidObject 包装
+场景加载器 — 严格按 all.usd 世界空间坐标组装。
+
+坐标系统：米制 (metersPerUnit=1.0)，Z 轴向上。
+所有位置来自 all.usd (cm) ÷100 转为米制，加 Z_SHIFT 使场景在地面上方。
+
+all.usd 精确世界坐标（m，Z_SHIFT 前）：
+  - Desk:            (0.000, 1.500, -0.750)
+  - Sink center:     (0.624, 1.199, -0.264)
+  - Rack center:     (1.136, 0.748, -0.104)
+  - Piper LEFT:      (0.900, 1.370,  0.145)
+  - Piper RIGHT:     (1.350, 1.370,  0.145)
+  - Plate 1:         (0.802, 1.022, -0.057)
+  - Plate 2:         (0.864, 0.890,  0.001)
+  - Plate 3:         (0.922, 1.042,  0.051)
 """
 
 import os
@@ -21,137 +30,257 @@ from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObj
 
 from .piper_cfg import PIPER_CFG
 
+# ======================================================================
+# Z_SHIFT — 抬升整个场景使桌子底与地面 Z=0 齐平
+# Desk world Z=-0.75 → Z_SHIFT=0.75 → desk at Z=0
+# ======================================================================
+Z_SHIFT = 0.75
 
-def _cleanup_physics_apis(prim):
-    """递归移除 prim 子树中所有子 prim 上的物理 API。
+# ======================================================================
+# 场景布局常量（米制，已加 Z_SHIFT）
+# 坐标来源：all.usd 世界空间坐标 ÷100 → 米 → +Z_SHIFT
+# ======================================================================
 
-    原因：赛方 USD 中部分 Mesh prim 自带 RigidBodyAPI/CollisionAPI/MassAPI，
-    与根 prim 的 API 冲突导致 PhysX 报 "multiple rigid bodies in hierarchy"。
-    """
+# 桌子
+DESK_X, DESK_Y, DESK_Z = 0.000, 1.500, -0.750 + Z_SHIFT  # → (0.0, 1.5, 0.0)
+
+# 水槽（洗碗机水槽 mesh 的世界中心）
+SINK_X, SINK_Y, SINK_Z = 0.624, 1.199, -0.264 + Z_SHIFT  # → (0.624, 1.199, 0.486)
+# 水槽内腔近似范围（盘子落在此区域）
+SINK_INNER_X_MIN, SINK_INNER_X_MAX = 0.62, 1.10
+SINK_INNER_Y_MIN, SINK_INNER_Y_MAX = 0.70, 1.20
+SINK_BOTTOM_Z = -0.264 + Z_SHIFT  # 碰撞面在水槽中心高度 → 0.486
+
+# 洗碗机卡槽（dishwasher_basin_step mesh 的世界中心）
+RACK_X, RACK_Y, RACK_Z = 1.136, 0.748, -0.104 + Z_SHIFT  # → (1.136, 0.748, 0.646)
+
+# Piper 左臂（piper_ros2_）
+PIPER_L_X, PIPER_L_Y, PIPER_L_Z = 0.900, 1.370, 0.145 + Z_SHIFT  # → (0.900, 1.370, 0.895)
+
+# Piper 右臂（piper_ros2__04）
+PIPER_R_X, PIPER_R_Y, PIPER_R_Z = 1.350, 1.370, 0.145 + Z_SHIFT  # → (1.350, 1.370, 0.895)
+
+# 盘子初始位置（all.usd plate_1, plate_02, plate_03 世界坐标）
+PLATE_SPAWN_POSITIONS = [
+    (0.802, 1.022, -0.057 + Z_SHIFT),  # → (0.802, 1.022, 0.693)
+    (0.864, 0.890,  0.001 + Z_SHIFT),  # → (0.864, 0.890, 0.751)
+    (0.922, 1.042,  0.051 + Z_SHIFT),  # → (0.922, 1.042, 0.801)
+]
+
+# ======================================================================
+# 工具
+# ======================================================================
+
+
+def _clean_physics_from_children(prim):
+    """递归清除 prim 子树中所有物理 API（RigidBody/Collision/Mass/ArticulationRoot）。"""
     from pxr import UsdPhysics
 
     for child in prim.GetChildren():
-        for api_cls in [UsdPhysics.RigidBodyAPI, UsdPhysics.CollisionAPI,
-                         UsdPhysics.MassAPI, UsdPhysics.ArticulationRootAPI]:
-            if child.HasAPI(api_cls):
-                child.RemoveAPI(api_cls)
-        _cleanup_physics_apis(child)
+        for api_cls in [
+            UsdPhysics.RigidBodyAPI,
+            UsdPhysics.CollisionAPI,
+            UsdPhysics.MassAPI,
+            UsdPhysics.ArticulationRootAPI,
+        ]:
+            try:
+                if child.HasAPI(api_cls):
+                    child.RemoveAPI(api_cls)
+            except Exception:
+                pass
+        _clean_physics_from_children(child)
+
+
+def _spawn_collision_cuboid(prim_path: str, center: tuple, size: tuple):
+    """生成一个运动学碰撞立方体（透明，不可见，用于支撑盘子）。"""
+    sim_utils.CuboidCfg(
+        size=size,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            rigid_body_enabled=True,
+            kinematic_enabled=True,
+            disable_gravity=True,
+        ),
+        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+        visual_material=sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.3, 0.3, 0.3), opacity=0.0,
+        ),
+    ).func(
+        prim_path,
+        sim_utils.CuboidCfg(
+            size=size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.3, 0.3, 0.3), opacity=0.0,
+            ),
+        ),
+        translation=center,
+    )
+
+
+# ======================================================================
+# SceneLoader
+# ======================================================================
 
 
 class SceneLoader:
-    """赛方场景组件化加载器。
-
-    Attributes:
-        piper: Piper 机械臂 Articulation 实例 (sim.reset() 后可用)
-        plates: dict[str, RigidObject]，key 为 plate name
-        assets_root: 赛方素材根目录
-    """
+    """场景加载器 — 严格按 all.usd 世界空间坐标组装。"""
 
     def __init__(self, assets_root: str = "~/dishwasher_ws/assets/isaac_dishwisher"):
         self.assets_root = os.path.expanduser(assets_root)
-        self._piper_cfg: Optional[ArticulationCfg] = None
-        self._plate_prims: list[tuple[str, str, float]] = []  # (prim_path, label, mass)
-        self.piper: Optional[Articulation] = None
+        self._piper_l_cfg: Optional[ArticulationCfg] = None
+        self._piper_r_cfg: Optional[ArticulationCfg] = None
+        self._plate_prims: list[tuple[str, str, float]] = []
+
+        # 运行时可用的资产引用
+        self.piper_l: Optional[Articulation] = None  # 左臂
+        self.piper_r: Optional[Articulation] = None  # 右臂
         self.plates: dict[str, RigidObject] = {}
 
-    # ---- Static objects ----
+    # ---- Static objects -------------------------------------------------
 
     def spawn_static_objects(self) -> None:
-        """Spawn 地面、灯光、洗碗机桌子（纯静态几何，无需物理包装）。"""
+        """生成地面、灯光、桌子 + 水槽底碰撞 + 卡槽底碰撞。"""
         # 地面
         sim_utils.GroundPlaneCfg().func(
             "/World/defaultGroundPlane", sim_utils.GroundPlaneCfg()
         )
+
         # 灯光
         sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75)).func(
-            "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+            "/World/Light",
+            sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75)),
         )
-        # 洗碗机桌子
+
+        # 桌子 — 引用 dishwasher_desk.usda
         desk_usd = f"{self.assets_root}/dishwasher_desk.usda"
         if os.path.exists(desk_usd):
             sim_utils.UsdFileCfg(usd_path=desk_usd).func(
                 "/World/DishwasherDesk",
                 sim_utils.UsdFileCfg(usd_path=desk_usd),
-                translation=(0.0, 0.0, 0.0),
+                translation=(DESK_X, DESK_Y, DESK_Z),
             )
 
-    # ---- Piper ----
+        # 清除桌子 mesh 上残留的物理 API
+        import omni.usd
 
-    def spawn_piper(self, translation: tuple = (0.0, 0.0, 0.0)) -> ArticulationCfg:
-        """Spawn Piper 机械臂 USD 模型。
+        stage = omni.usd.get_context().get_stage()
+        desk_root = stage.GetPrimAtPath("/World/DishwasherDesk")
+        if desk_root:
+            _clean_physics_from_children(desk_root)
+            print("[Init] 桌子物理 API 已清理", flush=True)
 
-        Returns:
-            PIPER_CFG 的副本，可在 sim.reset() 前修改属性。
-        """
-        piper_usd = f"{self.assets_root}/piper/piper_description_v100_realsense_camera_v2.usd"
+        # 水槽底碰撞面 — 盘子落入水槽后停在此处
+        sink_cx = (SINK_INNER_X_MIN + SINK_INNER_X_MAX) / 2
+        sink_cy = (SINK_INNER_Y_MIN + SINK_INNER_Y_MAX) / 2
+        sink_sx = SINK_INNER_X_MAX - SINK_INNER_X_MIN
+        sink_sy = SINK_INNER_Y_MAX - SINK_INNER_Y_MIN
+        _spawn_collision_cuboid(
+            "/World/CollisionSinkBottom",
+            (sink_cx, sink_cy, SINK_BOTTOM_Z),
+            (sink_sx, sink_sy, 0.005),
+        )
+
+        # 卡槽底碰撞面 — 盘子放置后停在此处
+        _spawn_collision_cuboid(
+            "/World/CollisionRack",
+            (RACK_X, RACK_Y, RACK_Z),
+            (0.30, 0.42, 0.005),
+        )
+
+        print("[Init] 场景已加载 (all.usd 精确坐标)", flush=True)
+
+    # ---- Piper arms -----------------------------------------------------
+
+    def _spawn_one_piper(
+        self, prim_path: str, translation: tuple
+    ) -> ArticulationCfg:
+        """生成一个 Piper 机械臂并返回 ArticulationCfg。"""
+        piper_usd = (
+            f"{self.assets_root}/piper/"
+            "piper_description_v100_realsense_camera_v2.usd"
+        )
         if not os.path.exists(piper_usd):
             raise FileNotFoundError(f"Piper USD not found: {piper_usd}")
 
         sim_utils.UsdFileCfg(usd_path=piper_usd).func(
-            "/World/Piper",
+            prim_path,
             sim_utils.UsdFileCfg(usd_path=piper_usd),
             translation=translation,
         )
 
-        self._piper_cfg = PIPER_CFG.copy()
-        self._piper_cfg.init_state.pos = translation
-        return self._piper_cfg
+        cfg = PIPER_CFG.copy()
+        cfg.prim_path = prim_path
+        cfg.init_state.pos = translation
+        return cfg
 
-    # ---- Plates ----
+    def spawn_piper_left(
+        self, translation: tuple = (PIPER_L_X, PIPER_L_Y, PIPER_L_Z)
+    ) -> ArticulationCfg:
+        """生成 Piper 左臂。"""
+        self._piper_l_cfg = self._spawn_one_piper("/World/Piper_L", translation)
+        return self._piper_l_cfg
+
+    def spawn_piper_right(
+        self, translation: tuple = (PIPER_R_X, PIPER_R_Y, PIPER_R_Z)
+    ) -> ArticulationCfg:
+        """生成 Piper 右臂。"""
+        self._piper_r_cfg = self._spawn_one_piper("/World/Piper_R", translation)
+        return self._piper_r_cfg
+
+    def spawn_piper(
+        self, translation: tuple = (PIPER_L_X, PIPER_L_Y, PIPER_L_Z)
+    ) -> ArticulationCfg:
+        """生成 Piper 左臂（兼容旧接口）。"""
+        return self.spawn_piper_left(translation)
+
+    # ---- Plates ---------------------------------------------------------
 
     def spawn_plates(
         self,
         positions: list[tuple[float, float, float]] | None = None,
     ) -> list[str]:
-        """Spawn 盘子 USD mesh 并施加物理属性。
+        """生成盘子 — 位置来自 all.usd 世界坐标。"""
 
-        盘子 USD 文件是纯 mesh（无 RigidBodyAPI），手动施加：
-        1. RigidBodyAPI + CollisionAPI + MassAPI 到根 prim
-        2. 递归清除子 prim 上可能残留的物理 API
-
-        Args:
-            positions: 每个盘子的初始位置，默认单个盘子 (0.0, 0.0, 0.5)
-
-        Returns:
-            prim_path 列表，供 wrap_assets() 使用。
-        """
         import omni.usd
         from pxr import UsdPhysics
 
         stage = omni.usd.get_context().get_stage()
 
         if positions is None:
-            positions = [(0.3, 0.0, 0.8)]
+            positions = list(PLATE_SPAWN_POSITIONS)
 
-        plate_specs = [
-            (f"{self.assets_root}/plate.usdc", 1.0),    # bowl_plate
-            (f"{self.assets_root}/plate_1.usdc", 0.35),  # flat plate
+        plate_urls = [
+            f"{self.assets_root}/plate.usdc",
+            f"{self.assets_root}/plate_1.usdc",
         ]
 
         prim_paths = []
         for i, pos in enumerate(positions):
-            # 交替使用两种盘子
-            usd_path, mass = plate_specs[i % len(plate_specs)]
+            usd_path = plate_urls[i % len(plate_urls)]
             if not os.path.exists(usd_path):
                 continue
 
             prim_path = f"/World/Objects/Plate_{i}"
             label = f"plate_{i}"
 
-            # Spawn mesh
             sim_utils.UsdFileCfg(usd_path=usd_path).func(
                 prim_path,
                 sim_utils.UsdFileCfg(usd_path=usd_path),
                 translation=pos,
             )
 
-            # 清除子 prim 残留物理 API 并施加 API 到根 prim
             root = stage.GetPrimAtPath(prim_path)
-            _cleanup_physics_apis(root)
+            _clean_physics_from_children(root)
 
             UsdPhysics.RigidBodyAPI.Apply(root)
             UsdPhysics.CollisionAPI.Apply(root)
             mass_api = UsdPhysics.MassAPI.Apply(root)
+            mass = 0.35 if "plate_1" in usd_path else 1.0
             mass_api.GetMassAttr().Set(mass)
 
             self._plate_prims.append((prim_path, label, mass))
@@ -159,26 +288,32 @@ class SceneLoader:
 
         return prim_paths
 
-    # ---- Wrap ----
+    # ---- Wrap assets ----------------------------------------------------
 
     def wrap_assets(self) -> None:
-        """在 sim.reset() 之前调用，创建 Articulation / RigidObject 包装。
+        """创建 Isaac Lab Articulation / RigidObject 包装。"""
+        if self._piper_l_cfg is not None:
+            self.piper_l = Articulation(cfg=self._piper_l_cfg)
+        if self._piper_r_cfg is not None:
+            self.piper_r = Articulation(cfg=self._piper_r_cfg)
 
-        必须在 spawn_* 之后、sim.reset() 之前调用。
-        """
-        # Piper
-        if self._piper_cfg is not None:
-            self.piper = Articulation(cfg=self._piper_cfg)
-
-        # Plates
-        for prim_path, label, mass in self._plate_prims:
+        for prim_path, label, _mass in self._plate_prims:
             try:
-                obj = RigidObject(cfg=RigidObjectCfg(
-                    prim_path=prim_path,
-                    init_state=RigidObjectCfg.InitialStateCfg(
-                        pos=(0.0, 0.0, 0.0),  # pos 由 spawn 时 translation 决定
-                    ),
-                ))
+                obj = RigidObject(
+                    cfg=RigidObjectCfg(
+                        prim_path=prim_path,
+                        init_state=RigidObjectCfg.InitialStateCfg(
+                            pos=(0.0, 0.0, 0.0)
+                        ),
+                    )
+                )
                 self.plates[label] = obj
             except RuntimeError as e:
                 print(f"[SceneLoader] Failed to wrap {label}: {e}")
+
+    # ---- Convenience ----------------------------------------------------
+
+    @property
+    def piper(self) -> Optional[Articulation]:
+        """主机械臂（Level 1 使用左臂）。"""
+        return self.piper_l

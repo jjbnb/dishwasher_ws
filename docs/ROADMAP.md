@@ -277,7 +277,7 @@ M0: 环境验证          M1: Level 1          M2: Level 2          M3: Level 3 
   [Week 1]            [Week 2]            [Week 3-4]          [Week 5-6]          [Week 7]
   
   场景跑通             100% 成功率          95% 成功率           85% 成功率           Docker+视频+文档
-  ├─ 加载 all.usd      ├─ 规则化策略        ├─ 多模态融合感知     ├─ RL/IL 增强       ├─ Dockerfile
+  ├─ 原生 all.usd 校验 ├─ 规则化策略        ├─ 多模态融合感知     ├─ RL/IL 增强       ├─ Dockerfile
   ├─ Piper Articulation ├─ 固定抓取姿态     ├─ 启发式抓取        ├─ 深度补全         ├─ 录制视频
   ├─ 相机输出验证      ├─ 顺序放置          ├─ 域随机化          ├─ 主动感知         ├─ 技术文档
   ├─ 盘子物理验证      ├─ 状态机闭环        ├─ 碰撞检测          ├─ 力控抓取         ├─ 评估报告
@@ -304,10 +304,10 @@ main
 
 ### Step 1：场景跑通（1-2 天）✅ 已完成
 
-- [x] 用 Python API 打开 all.usd，确认所有资产加载正常
+- [x] 用 Python API 打开原生 all.usd，确认所有资产加载正常
 - [x] 确认 Piper 关节能通过 PD 控制移动
 - [x] 确认盘子模型的物理属性（质量、碰撞）正确
-- [x] SceneLoader 组件化加载方案
+- [x] NativeSceneLoader 直接以赛方 all.usd 为仿真基座
 
 ### Step 2：感知模块（2-3 天）← 当前优先
 
@@ -320,6 +320,8 @@ main
 **目标：** 针对检测到的盘子生成抓取姿态，通过 IK 到达目标
 
 **交付物：** `grasp_generator.py` + `ik_controller.py` — 输入物体位姿，输出机械臂能到达的抓取姿态
+
+**当前 native 进展：** `scripts/run_level1_native.py` 已能在原生 `all.usd` 上完成 RigidObject 检测、规则抓取/放置目标生成、Piper IK smoke solve。
 
 ### Step 4：Level 1 闭环（2-3 天）
 
@@ -418,11 +420,12 @@ p.update(dt)                         # 读取状态
 **Plate 物理修复**:
 递归清理子 prim 上的物理 API → 仅 root prim 应用 RigidBody + Collision + Mass API。
 
-**SceneLoader 模式**:
-组件化装配 — 逐个 spawn USD 组件 → 应用物理 → Articulation/RigidObject 包装。
+**NativeSceneLoader 模式**:
+直接打开赛方 `all.usd` 作为仿真基座；不重新 spawn 桌子、盘子、Piper，不做 `Z_SHIFT`，不改原始物理 API。直接 Isaac Lab 控制时仅运行时临时禁用嵌套 `PhysicsScene` 和 ROS2 `ActionGraph`，不保存源 USD。
 
 ### 已知限制
 
 - **RTX 5070 12GB**: GUI + 完整 PhysX 场景 CUDA OOM。Headless 物理正常。A40 48GB 可解决。
+- **原生 all.usd 单位**: `metersPerUnit=0.01`，张量读数按 stage units 为厘米尺度；后续规划/控制需要统一处理单位。
 - **Isaac Sim 5.1 截图 API**: `omni.syntheticdata`、`omni.replicator`、`renderer.capture` 均不可靠。
 - **USD 导出**: `stage.Export()` 只捕获 USD prim transform，不捕获 PhysX Fabric 张量状态。

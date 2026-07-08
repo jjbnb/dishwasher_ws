@@ -15,11 +15,12 @@ import sys
 parser = argparse.ArgumentParser(description="M0: 赛方场景 Prim 结构探查")
 parser.add_argument("--scene", type=str,
                     default=os.path.expanduser("~/dishwasher_ws/assets/isaac_dishwisher/all.usd"))
-args = parser.parse_args()
 
 os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 
 from isaaclab.app import AppLauncher
+AppLauncher.add_app_launcher_args(parser)
+args = parser.parse_args()
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
