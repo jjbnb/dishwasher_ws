@@ -67,9 +67,14 @@ class Level1Pipeline:
         self.place_release_steps = place_release_steps
         self.unit_scale = unit_scale
         self.place_position = place_position
+        self.ik_position_scale = 1.0
 
         # 子模块
-        self.ik = PiperIKController(robot, device=device)
+        self.ik = PiperIKController(
+            robot,
+            device=device,
+            position_scale=self.ik_position_scale,
+        )
         self.gripper = PiperGripper(robot)
         self.state_machine = StateMachine()
 

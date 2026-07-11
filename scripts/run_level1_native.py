@@ -144,7 +144,7 @@ for name, (pos, _quat) in place_plan.items():
     )
 
 print("\n[4] IK smoke solve for first pre_grasp target")
-ik = PiperIKController(robot, device=args_cli.device)
+ik = PiperIKController(robot, device=args_cli.device, position_scale=1.0)
 target_pos, target_quat = grasp_plan["pre_grasp"]
 target_pos_w = torch.tensor(target_pos, dtype=torch.float32, device=args_cli.device).unsqueeze(0)
 target_quat_w = torch.tensor(target_quat, dtype=torch.float32, device=args_cli.device).unsqueeze(0)

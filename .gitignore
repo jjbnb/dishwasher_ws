@@ -6,6 +6,7 @@ __pycache__/
 .pt
 
 # Results
+outputs/
 results/**/*.csv
 results/**/*.json
 results/**/*.png

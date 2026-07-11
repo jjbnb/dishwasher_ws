@@ -28,6 +28,15 @@ GRASP_OFFSET = {
     "post_grasp_z_offset": 0.15,  # 抓起后抬升 15cm
 }
 
+RIM_GRASP = {
+    "plate_radius": 0.12,          # 盘子近似半径 12cm
+    "rim_standoff": 0.04,          # TCP 保持在盘沿外侧 4cm
+    "approach_distance": 0.10,     # 预抓取沿盘沿法线后退 10cm
+    "pre_grasp_z_offset": 0.25,    # rim 预抓取保持高位，下降阶段另做
+    "grasp_z_offset": 0.025,
+    "post_grasp_z_offset": 0.15,
+}
+
 # 放置参数——洗碗机卡槽位置
 # 来自 all.usd dishwasher_basin_step 世界坐标 ÷100 + Z_SHIFT(0.75)
 # all.usd: (113.555cm, 74.844cm, -10.436cm) → (1.136m, 0.748m, -0.104m) → +Z_SHIFT
@@ -89,6 +98,72 @@ def generate_grasp_pose(
         "pre_grasp": (pre_grasp_pos, grasp_quat.copy()),
         "grasp": (grasp_pos, grasp_quat.copy()),
         "post_grasp": (post_grasp_pos, grasp_quat.copy()),
+    }
+
+
+def generate_rim_grasp_pose(
+    plate_pos: np.ndarray,
+    plate_quat: np.ndarray,
+    *,
+    arm_base_pos: np.ndarray | tuple[float, float, float] | None = None,
+    unit_scale: float = 1.0,
+    plate_radius: float | None = None,
+    radial_xy: np.ndarray | tuple[float, float] | None = None,
+    candidate_name: str = "rim",
+) -> dict:
+    """Generate a plate-rim grasp candidate instead of targeting the center.
+
+    The previous rule placed the TCP above the plate center. That is a useful
+    pre-grasp marker but a poor grasp: a parallel gripper should approach a
+    reachable rim point, descend onto the rim, close, and retreat. This helper
+    chooses the rim point facing the acting arm base, then offsets outward to
+    leave room for the gripper fingers.
+    """
+
+    center = np.asarray(plate_pos, dtype=np.float64)
+    if arm_base_pos is None:
+        # Left Piper base in native all.usd stage units.
+        arm_base = np.array([90.0, 137.0, 14.45], dtype=np.float64)
+    else:
+        arm_base = np.asarray(arm_base_pos, dtype=np.float64)
+
+    if radial_xy is None:
+        radial = arm_base[:2] - center[:2]
+    else:
+        radial = np.asarray(radial_xy, dtype=np.float64)
+    norm = float(np.linalg.norm(radial))
+    if norm < 1.0e-6:
+        radial = np.array([1.0, 0.0], dtype=np.float64)
+    else:
+        radial = radial / norm
+
+    radius = (RIM_GRASP["plate_radius"] if plate_radius is None else plate_radius) * unit_scale
+    standoff = RIM_GRASP["rim_standoff"] * unit_scale
+    approach = RIM_GRASP["approach_distance"] * unit_scale
+    pre_z = RIM_GRASP["pre_grasp_z_offset"] * unit_scale
+    grasp_z = RIM_GRASP["grasp_z_offset"] * unit_scale
+    post_z = RIM_GRASP["post_grasp_z_offset"] * unit_scale
+
+    rim_xy = center[:2] + radial * radius
+    grasp_xy = rim_xy + radial * standoff
+    pre_xy = grasp_xy + radial * approach
+
+    grasp_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    grasp_pos = np.array([grasp_xy[0], grasp_xy[1], center[2] + grasp_z], dtype=np.float64)
+    pre_grasp_pos = np.array([pre_xy[0], pre_xy[1], center[2] + pre_z], dtype=np.float64)
+    post_grasp_pos = np.array([pre_xy[0], pre_xy[1], center[2] + post_z], dtype=np.float64)
+
+    return {
+        "pre_grasp": (pre_grasp_pos, grasp_quat.copy()),
+        "grasp": (grasp_pos, grasp_quat.copy()),
+        "post_grasp": (post_grasp_pos, grasp_quat.copy()),
+        "metadata": {
+            "strategy": candidate_name,
+            "radial_xy": radial.copy(),
+            "rim_xy": rim_xy.copy(),
+            "grasp_xy": grasp_xy.copy(),
+            "pre_xy": pre_xy.copy(),
+        },
     }
 
 

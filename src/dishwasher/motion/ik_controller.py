@@ -34,7 +34,7 @@ class PiperIKController:
         ik: 底层 DifferentialIKController 实例
         ee_body_name: 末端执行器 body 名称（默认 "link6"）
         ee_body_idx: 末端执行器在 Articulation body 列表中的索引
-        ee_jacobi_idx: 末端执行器在 Jacobian 矩阵中对应的行索引 (= ee_body_idx - 1)
+        ee_jacobi_idx: 末端执行器在 Jacobian 矩阵中对应的行索引
         arm_joint_ids: 臂关节 (joint1-6) 在 joint 列表中的索引
     """
 
@@ -49,6 +49,10 @@ class PiperIKController:
         device: str = "cuda:0",
         ik_method: str = "dls",
         ik_params: dict | None = None,
+        position_scale: float = 1.0,
+        command_type: str = "pose",
+        delta_gain: float = 1.0,
+        rotate_jacobian_to_base: bool = True,
     ):
         """初始化 Piper IK 控制器。
 
@@ -57,16 +61,35 @@ class PiperIKController:
             device: 计算设备
             ik_method: IK 求逆方法 ("pinv", "svd", "trans", "dls")
             ik_params: 方法参数覆盖，None 则使用默认值
+            position_scale: 位置缩放。默认 1.0，表示目标位置、body pose、
+                Jacobian 使用同一套 stage 单位；只有确认单位不匹配时才覆盖。
+            command_type: "pose" 同时控制位置和姿态；"position" 只控制位置。
+            delta_gain: 每步 IK 关节增量缩放，1.0 表示使用原始求解增量。
+            rotate_jacobian_to_base: 是否把 Jacobian 从 world frame 旋到 base frame。
         """
         self._robot = robot
         self._device = device
+        self._position_scale = float(position_scale)
+        self._command_type = command_type
+        self._delta_gain = float(delta_gain)
+        self._rotate_jacobian_to_base = bool(rotate_jacobian_to_base)
         self._needs_reset_skip = False  # reset 后第一步标记
 
         # ---- 发现末端执行器 ----
         ee_result = robot.find_bodies(self.EE_BODY_NAME)
         ee_idx = ee_result[0][0]
         self.ee_body_idx: int = ee_idx.item() if hasattr(ee_idx, 'item') else int(ee_idx)
-        self.ee_jacobi_idx: int = self.ee_body_idx - 1
+        num_jacobian_bodies = robot.root_physx_view.get_jacobians().shape[1]
+        if num_jacobian_bodies == robot.num_bodies:
+            self.ee_jacobi_idx = self.ee_body_idx
+        elif num_jacobian_bodies == robot.num_bodies - 1:
+            self.ee_jacobi_idx = self.ee_body_idx - 1
+        else:
+            raise RuntimeError(
+                "Unexpected Jacobian body dimension: "
+                f"{num_jacobian_bodies} for {robot.num_bodies} bodies"
+            )
+        self.num_jacobian_bodies = int(num_jacobian_bodies)
 
         # ---- 发现臂关节 ----
         arm_result = robot.find_joints(self.ARM_JOINT_NAMES)
@@ -76,7 +99,7 @@ class PiperIKController:
 
         # ---- 构建 IK ----
         cfg = DifferentialIKControllerCfg(
-            command_type="pose",
+            command_type=command_type,
             use_relative_mode=False,
             ik_method=ik_method,
             ik_params=ik_params,
@@ -84,7 +107,10 @@ class PiperIKController:
         self.ik = DifferentialIKController(cfg, num_envs=1, device=self._device)
 
         # ---- 目标位姿缓冲区 ----
-        self._target_pose = torch.zeros(1, 7, device=self._device)
+        command_dim = 3 if command_type == "position" else 7
+        self._command = torch.zeros(1, command_dim, device=self._device)
+        self._target_pos = torch.zeros(1, 3, device=self._device)
+        self._target_quat = torch.zeros(1, 4, device=self._device)
 
     # ------------------------------------------------------------------
     # Public API
@@ -105,32 +131,43 @@ class PiperIKController:
             joint_pos = self._robot.data.joint_pos[:, self.arm_joint_ids]
             return joint_pos.clone()
 
-        # 1. 设置 IK 目标
-        self._target_pose[:] = torch.cat([target_pos, target_quat], dim=-1)
-        self.ik.set_command(self._target_pose)
-
-        # 2. 获取世界坐标系下的末端位姿和 base 位姿
+        # 1. 获取世界坐标系下的末端位姿和 base 位姿
         ee_pose_w = self._robot.data.body_pose_w[:, self.ee_body_idx]
         root_pose_w = self._robot.data.root_pose_w
 
-        # 3. 转换到 base frame
+        # 2. 转换到 base frame
         ee_pos_b, ee_quat_b = subtract_frame_transforms(
             root_pose_w[:, 0:3], root_pose_w[:, 3:7],
             ee_pose_w[:, 0:3], ee_pose_w[:, 3:7],
         )
 
+        # 3. 设置 IK 目标
+        target_pos_scaled = target_pos * self._position_scale
+        self._target_pos[:] = target_pos_scaled
+        self._target_quat[:] = target_quat
+        if self._command_type == "position":
+            self._command[:] = target_pos_scaled
+            self.ik.set_command(self._command, ee_quat=ee_quat_b)
+        else:
+            self._command[:] = torch.cat([target_pos_scaled, target_quat], dim=-1)
+            self.ik.set_command(self._command)
+
         # 4. 获取 Jacobian 并转到 base frame
         jacobian = self._robot.root_physx_view.get_jacobians()[
             :, self.ee_jacobi_idx, :, self.arm_joint_ids
         ]
-        base_rot = root_pose_w[:, 3:7]
-        base_rot_matrix = matrix_from_quat(quat_inv(base_rot))
-        jacobian[:, :3, :] = torch.bmm(base_rot_matrix, jacobian[:, :3, :])
-        jacobian[:, 3:, :] = torch.bmm(base_rot_matrix, jacobian[:, 3:, :])
+        if self._rotate_jacobian_to_base:
+            base_rot = root_pose_w[:, 3:7]
+            base_rot_matrix = matrix_from_quat(quat_inv(base_rot))
+            jacobian[:, :3, :] = torch.bmm(base_rot_matrix, jacobian[:, :3, :])
+            jacobian[:, 3:, :] = torch.bmm(base_rot_matrix, jacobian[:, 3:, :])
 
         # 5. 求解
         joint_pos = self._robot.data.joint_pos[:, self.arm_joint_ids]
-        joint_pos_des = self.ik.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
+        ee_pos_scaled = ee_pos_b * self._position_scale
+        joint_pos_des = self.ik.compute(ee_pos_scaled, ee_quat_b, jacobian, joint_pos)
+        if self._delta_gain != 1.0:
+            joint_pos_des = joint_pos + self._delta_gain * (joint_pos_des - joint_pos)
 
         return joint_pos_des
 
@@ -141,7 +178,12 @@ class PiperIKController:
             target_pos: 目标位置，shape (1, 3)，base frame
             target_quat: 目标四元数 (w, x, y, z)，shape (1, 4)，base frame
         """
-        self._target_pose[:] = torch.cat([target_pos, target_quat], dim=-1)
+        self._target_pos[:] = target_pos * self._position_scale
+        self._target_quat[:] = target_quat
+        if self._command_type == "position":
+            self._command[:] = self._target_pos
+        else:
+            self._command[:] = torch.cat([self._target_pos, target_quat], dim=-1)
 
     def notify_reset(self):
         """通知控制器机器人已被 reset，下一步将跳过 IK 求解。"""
@@ -176,8 +218,9 @@ class PiperIKController:
             ee_pose_w[:, 0:3], ee_pose_w[:, 3:7],
         )
 
+        ee_pos_scaled = ee_pos_b * self._position_scale
         pos_error, rot_error = compute_pose_error(
-            ee_pos_b, ee_quat_b,
-            self._target_pose[:, 0:3], self._target_pose[:, 3:7],
+            ee_pos_scaled, ee_quat_b,
+            self._target_pos, self._target_quat,
         )
         return float(torch.norm(pos_error)), float(torch.norm(rot_error))
